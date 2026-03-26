@@ -8,3 +8,6 @@ dependencies = [
     "numpy>=2.4.3",
     "requests>=2.33.0",
 ]
+
+[tool.uv.sources]
+my_local_package = { path = "./src" }
