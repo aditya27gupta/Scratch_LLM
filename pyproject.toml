@@ -1,6 +1,6 @@
 [project]
 name = "scratch-llm"
-version = "0.1.0"
+version = "1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -9,5 +9,17 @@ dependencies = [
     "requests>=2.33.0",
 ]
 
-[tool.uv.sources]
-my_local_package = { path = "./src" }
+[tool.ruff]
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".git",
+    ".ruff_cache",
+    "__pypackages__",
+    ".venv",
+]
+line-length = 120
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = []

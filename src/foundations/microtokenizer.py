@@ -1,40 +1,22 @@
 """
 How text becomes numbers.
 
-The compression algorithm hiding inside every LLM.
-Byte-Pair Encoding learns a vocabulary by iteratively merging the most frequent
-adjacent token pairs, then encodes new text by replaying those merges in priority order.
+The compression algorithm hiding inside every LLM. Byte-Pair Encoding learns a vocabulary by iteratively merging the most frequent adjacent token pairs, then encodes new text by replaying those merges in priority order.
 """
 
-from pathlib import Path
+import time
 
 import numpy as np
-import requests
 
-from src.log import logger
+from utility import load_names_data, logger
 
 RED = "\033[31m"
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
-VOCAB_SIZE = 512  # Final vocab = 256 byte tokens + 256 merges = 512 tokens.
-DATA_URL = "https://raw.githubusercontent.com/karpathy/makemore/master/names.txt"
-DATA_FILE = "./data/names.txt"
-
-
-def load_data(url: str, filename: str) -> bytes:
-    """Download dataset if not cached, return raw bytes."""
-    file_path = Path(filename)
-    if not file_path.exists():
-        logger.info(f"Downloading {filename}...")
-        response = requests.get(url=url, allow_redirects=True, timeout=5)
-        response.raise_for_status()
-        file_path.write_bytes(response.content)
-    return file_path.read_bytes()
-
 
 class Tokenizer:
-    def __init__(self, vocab_size: int) -> None:
+    def __init__(self, vocab_size: int = 512) -> None:
         self.vocab_size = np.int32(vocab_size)
         self.vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
         self.merges: dict[tuple[int, int], int] = {}
@@ -88,13 +70,15 @@ class Tokenizer:
 
 
 if __name__ == "__main__":
-    raw_data = load_data(DATA_URL, DATA_FILE)
+    raw_data = load_names_data()
     corpus_ids = np.frombuffer(raw_data, dtype=np.uint8).astype(dtype=np.uint32)
-    logger.info(f"Corpus: {len(raw_data):} bytes, base vocab: 256 token, final_vocab: {VOCAB_SIZE} token")
-    tokenizer = Tokenizer(VOCAB_SIZE)
+    logger.info(f"Corpus: {len(raw_data):} bytes, base vocab: 256 token")
+    tokenizer = Tokenizer()
+    start_time = time.perf_counter()
     logger.info("Training BPE...")
     tokenizer.train_bpe(corpus_ids)
-    logger.info(f"Training complete. {len(tokenizer.merges)} merges learned")
+    duration = time.perf_counter() - start_time
+    logger.info(f"Training took {duration:.2f} seconds. {len(tokenizer.merges)} merges learned")
 
     test_strings = ["Emma", "Xiomara", "Mary-Jane", "O'Brien", "", "Z"]
     for s in test_strings:
