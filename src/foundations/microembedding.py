@@ -43,8 +43,8 @@ class EmbeddingModel:
         """
         sparse: np.ndarray = np.zeros(self.vocab_size)
         for ngram in self.extract_ngrams(text):
-            if ngram in self.vocab:
-                idx = self.vocab[ngram]
+            idx = self.vocab.get(ngram)
+            if idx is not None:
                 sparse[idx] += 1.0
         return sparse
 
@@ -65,7 +65,7 @@ class EmbeddingModel:
         and makes the embedding space isotropic (all directions have equal variance).
         This is standard practice in contrastive learning (SimCLR, CLIP).
         """
-        norm = np.sqrt(np.sum(vec**2))
+        norm = np.linalg.norm(vec)
         if norm < 1e-10:
             return vec
         return vec / norm
@@ -96,7 +96,7 @@ class EmbeddingModel:
         Since vectors are L2-normalized, cosine similarity = dot product.
         Range: [-1, 1] where 1 = identical direction, -1 = opposite, 0 = orthogonal.
         """
-        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10)
+        return float(np.dot(a, b))
 
     def infonce_loss_and_grads(
         self,
@@ -117,45 +117,33 @@ class EmbeddingModel:
 
         Returns: (avg_loss, anchor_grads, positive_grads)
         """
-        bs = len(anchor_embs)
-        total_loss = 0.0
+        bs = anchor_embs.shape[0]
 
-        anchor_grads = np.zeros((bs, self.embedding_dim))
-        positive_grads = np.zeros((bs, self.embedding_dim))
+        sim_pos = np.sum(anchor_embs * positive_embs, axis=1) / temperature  # shape: [batch_size]
+        sim_neg = (anchor_embs @ anchor_embs.T) / temperature  # shape: [batch_size, batch_size]
 
-        for i in range(bs):
-            # Similarity to positive pair
-            sim_pos = self.cosine_similarity(anchor_embs[i], positive_embs[i]) / temperature
+        mask = 1.0 - np.eye(bs)  # Mask to zero out self-similarity
+        neg_only = sim_neg * mask + (-1e9) * (1.0 - mask)  # shape: [batch_size, batch_size]
 
-            # Similarities to all negatives (other anchors in batch)
-            sim_negs: np.ndarray = np.dot(anchor_embs[i], anchor_embs.T) / temperature  # shape: [batch_size]
-            sim_negs = np.delete(sim_negs, i)  # Remove similarity to itself
+        # Log-sum-exp trick for numerical stability (subtract max before exp)
+        max_sim = np.maximum(sim_pos, np.max(neg_only, axis=1))  # shape: [batch_size]
+        exp_pos = np.exp(sim_pos - max_sim)
+        exp_neg = np.exp(sim_neg - max_sim[:, None]) * mask  # shape: [batch_size, batch_size]
+        denom = exp_pos + np.sum(exp_neg, axis=1)  # shape: [batch_size]
 
-            # Log-sum-exp trick for numerical stability (subtract max before exp)
-            max_sim = max([sim_pos] + sim_negs)
-            exp_pos = np.exp(sim_pos - max_sim)
-            exp_negs = np.exp(sim_negs - max_sim)
-            denom = exp_pos + sum(exp_negs)
+        p_pos = exp_pos / denom  # shape: [batch_size]
+        p_neg = exp_neg / denom[:, None]  # shape: [batch_size, batch_size]
 
-            # Loss: -log(softmax probability of positive pair)
-            total_loss += -np.log(max(exp_pos / denom, 1e-10))
+        # Loss: -log(softmax probability of positive pair)
+        total_loss = -np.mean(np.log(np.maximum(p_pos, 1e-10)))  # shape: [batch_size]
 
-            # Gradient of loss w.r.t. anchor embedding:
-            # d(loss)/d(anchor_i) = (1/tau) * (sum_j p_j * anchor_j - positive_i)
-            # where p_j = exp(sim_neg_j) / denom is the softmax probability
+        # Gradient of loss w.r.t. anchor embedding:
+        # d(loss)/d(anchor_i) = (1/tau) * ((p_pos - 1) * positive_i + sum_(j=!i) p_neg_j * anchor_j)
+        anchor_grads = (p_pos - 1.0)[:, None] * positive_embs / temperature
+        anchor_grads += (p_neg @ anchor_embs) / temperature  # shape: [batch_size, embedding_dim]
 
-            # Positive contribution: pushes anchor toward positive
-            p_pos = exp_pos / denom
-            anchor_grads[i] += (p_pos - 1.0) / temperature * positive_embs[i]
-            positive_grads[i] += (p_pos - 1.0) / temperature * anchor_embs[i]
-
-            # Negative contributions: pushes anchor away from negatives
-            p_neg = exp_negs / denom  # shape: [num_negatives]
-            anchor_grads[i] += (
-                np.sum(p_neg[:, np.newaxis] * anchor_embs[[j for j in range(bs) if j != i]], axis=0) / temperature
-            )
-
-        return total_loss / bs, anchor_grads, positive_grads
+        positive_grads = (p_pos - 1.0)[:, None] * anchor_embs / temperature  # shape: [batch_size, embedding_dim
+        return total_loss, anchor_grads, positive_grads
 
     def grad_through_norm(self, raw_emb: np.ndarray, grad_normalized: np.ndarray) -> np.ndarray:
         """Backpropagate gradient through L2 normalization.
@@ -165,52 +153,42 @@ class EmbeddingModel:
 
         The normalization Jacobian projects out the radial component of the gradient, leaving only the tangential direction on the unit sphere. Without this projection, gradients can push all embeddings in the same radial direction, causing "representation collapse" — the most common failure mode in contrastive learning.
         """
-        norm = np.sqrt(np.sum(raw_emb**2))
-        if norm < 1e-10:
-            return grad_normalized
-        e = raw_emb / norm
-        g_dot_e = np.dot(grad_normalized, e)
-        return (grad_normalized - e * g_dot_e) / norm
+        norms = np.linalg.norm(raw_emb, axis=1, keepdims=True)  # shape: [embedding_dim]
+        safe_norms = np.where(norms < 1e-10, 1.0, norms)  # Avoid division by zero
+        e = raw_emb / safe_norms
+        g_dot_e = np.sum(grad_normalized * e, axis=1, keepdims=True)  # shape: [embedding_dim]
+        grad_raw = (grad_normalized - e * g_dot_e) / safe_norms
+        return np.where(norms < 1e-10, grad_normalized, grad_raw)  # Zero out gradient if norm is too small
 
     def train(
         self,
         names: list[str],
         num_epochs: int = 30,
-        batch_size: int = 1_000,
+        batch_size: int = 64,
         learning_rate: float = 0.05,
         temperature: float = 0.1,
     ) -> None:
-        sparse_matrix = np.zeros((len(names), self.vocab_size))
-        for i, name in enumerate(names):
-            sparse_matrix[i] = self.encode_ngrams_sparse(name)
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             num_batches = 0
+            epoch_names = names[:]
+            np.random.shuffle(epoch_names)  # Shuffle names each epoch for better training dynamics
 
             for batch_start in range(0, len(names), batch_size):
-                batch = names[batch_start : batch_start + batch_size]
+                batch = epoch_names[batch_start : batch_start + batch_size]
                 if len(batch) < 2:
                     continue
 
                 # Encode anchors and positives (sparse n-grams → dense embeddings). Store both raw (pre-normalization) and normalized embeddings and raw embeddings are needed for the normalization Jacobian in backprop
-                anchor_sparse = np.zeros((len(batch), self.vocab_size))
-                positive_sparse = np.zeros((len(batch), self.vocab_size))
-                anchor_raw = np.zeros((len(batch), self.embedding_dim))
-                positive_raw = np.zeros((len(batch), self.embedding_dim))
-                anchor_embs = np.zeros((len(batch), self.embedding_dim))
-                positive_embs = np.zeros((len(batch), self.embedding_dim))
+                anchor_sparse = np.array([self.encode_ngrams_sparse(name) for name in batch])
+                positive_sparse = np.array([self.encode_ngrams_sparse(self.augment(name)) for name in batch])
 
-                for i in range(len(batch)):
-                    a_sp = sparse_matrix[batch_start + i]
-                    anchor_sparse[i] = a_sp
-                    p_sp = self.encode_ngrams_sparse(self.augment(batch[i]))
-                    positive_sparse[i] = p_sp
+                anchor_raw = anchor_sparse @ self.W.T  # [batch_size × embedding_dim]
+                positive_raw = positive_sparse @ self.W.T  # [batch_size × embedding_dim]
 
-                anchor_raw = self.encode_sparse_raw(anchor_sparse.T).T  # [batch_size × embedding_dim]
-                anchor_embs = self.l2_normalize(anchor_raw)
-                positive_raw = self.encode_sparse_raw(positive_sparse.T).T  # [batch_size × embedding_dim]
-                positive_embs = self.l2_normalize(positive_raw)
+                anchor_embs = np.array([self.l2_normalize(vec) for vec in anchor_raw])
+                positive_embs = np.array([self.l2_normalize(vec) for vec in positive_raw])
 
                 # Compute loss and gradients w.r.t. NORMALIZED embeddings
                 loss, a_grads, p_grads = self.infonce_loss_and_grads(anchor_embs, positive_embs, temperature)
@@ -221,15 +199,12 @@ class EmbeddingModel:
                 # Chain rule: d(L)/d(W) = d(L)/d(emb_norm) * d(emb_norm)/d(emb_raw) * d(emb_raw)/d(W)
                 # The normalization Jacobian (middle term) projects out the radial
                 # gradient component, preventing representation collapse.
-                grad_W = np.zeros((self.embedding_dim, self.vocab_size))  # [embedding_dim × vocab_size]
+                a_grad_raw = self.grad_through_norm(anchor_raw, a_grads)  # shape: [batch_size×embedding_dim]
+                p_grad_raw = self.grad_through_norm(positive_raw, p_grads)  # shape: [batch_size×embedding_dim]
 
-                for b_idx in range(len(batch)):
-                    # Transform gradients through normalization Jacobian
-                    a_grad_raw = self.grad_through_norm(anchor_raw[b_idx], a_grads[b_idx])
-                    p_grad_raw = self.grad_through_norm(positive_raw[b_idx], p_grads[b_idx])
-
-                    grad_W += a_grad_raw[:, np.newaxis] * anchor_sparse[b_idx][np.newaxis, :]
-                    grad_W += p_grad_raw[:, np.newaxis] * positive_sparse[b_idx][np.newaxis, :]
+                grad_W = (
+                    a_grad_raw.T @ anchor_sparse + p_grad_raw.T @ positive_sparse
+                )  # shape: [embedding_dim × vocab_size]
 
                 # SGD update (only for entries with non-zero gradients)
                 scale = learning_rate / len(batch)
@@ -246,7 +221,7 @@ class EmbeddingModel:
         Sparse version: only sums over non-zero entries in x, which is 10-15
         n-grams instead of the full 500-entry vocabulary.
         """
-        return self.l2_normalize(self.encode_sparse_raw(sparse_ngrams))
+        return self.l2_normalize(self.W @ sparse_ngrams)
 
     def find_nearest_neighbors(
         self,
@@ -256,17 +231,14 @@ class EmbeddingModel:
     ) -> list[tuple[str, float]]:
         """Find k nearest neighbors by cosine similarity in embedding space."""
         q_emb = self.encode_sparse(self.encode_ngrams_sparse(query))
-
-        similarities = []
-        for candidate in candidates:
-            if candidate == query:
-                continue
-            c_emb = self.encode_sparse(self.encode_ngrams_sparse(candidate))
-            sim = self.cosine_similarity(q_emb, c_emb)
-            similarities.append((candidate, sim))
-
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:k]
+        names = [c for c in candidates if c != query]
+        X = np.array([self.encode_ngrams_sparse(c) for c in names])
+        c_emb = X @ self.W.T  # shape: [num_candidates × embedding_dim]
+        norms = np.linalg.norm(c_emb, axis=1, keepdims=True)
+        c_emb_norm = c_emb / np.where(norms < 1e-10, 1.0, norms)  # shape: [num_candidates × embedding_dim]
+        sims = c_emb_norm @ q_emb  # shape: [num_candidates]
+        top_k = np.argsort(-sims)[:k]  # Indices of top k similarities
+        return [(names[i], float(sims[i])) for i in top_k]
 
 
 if __name__ == "__main__":
