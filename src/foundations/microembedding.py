@@ -123,7 +123,7 @@ class EmbeddingModel:
         sim_neg = (anchor_embs @ anchor_embs.T) / temperature  # shape: [batch_size, batch_size]
 
         mask = 1.0 - np.eye(bs)  # Mask to zero out self-similarity
-        neg_only = sim_neg * mask + (-1e9) * (1.0 - mask)  # shape: [batch_size, batch_size]
+        neg_only = sim_neg * mask + (-1e9) * (1.0 - mask)
 
         # Log-sum-exp trick for numerical stability (subtract max before exp)
         max_sim = np.maximum(sim_pos, np.max(neg_only, axis=1))  # shape: [batch_size]
@@ -135,7 +135,7 @@ class EmbeddingModel:
         p_neg = exp_neg / denom[:, None]  # shape: [batch_size, batch_size]
 
         # Loss: -log(softmax probability of positive pair)
-        total_loss = -np.mean(np.log(np.maximum(p_pos, 1e-10)))  # shape: [batch_size]
+        total_loss = -np.mean(np.log(np.maximum(p_pos, 1e-10)))
 
         # Gradient of loss w.r.t. anchor embedding:
         # d(loss)/d(anchor_i) = (1/tau) * ((p_pos - 1) * positive_i + sum_(j=!i) p_neg_j * anchor_j)
@@ -163,8 +163,8 @@ class EmbeddingModel:
     def train(
         self,
         names: list[str],
-        num_epochs: int = 30,
-        batch_size: int = 64,
+        num_epochs: int = 40,
+        batch_size: int = 128,
         learning_rate: float = 0.05,
         temperature: float = 0.1,
     ) -> None:
@@ -199,8 +199,8 @@ class EmbeddingModel:
                 # Chain rule: d(L)/d(W) = d(L)/d(emb_norm) * d(emb_norm)/d(emb_raw) * d(emb_raw)/d(W)
                 # The normalization Jacobian (middle term) projects out the radial
                 # gradient component, preventing representation collapse.
-                a_grad_raw = self.grad_through_norm(anchor_raw, a_grads)  # shape: [batch_size×embedding_dim]
-                p_grad_raw = self.grad_through_norm(positive_raw, p_grads)  # shape: [batch_size×embedding_dim]
+                a_grad_raw = self.grad_through_norm(anchor_raw, a_grads)
+                p_grad_raw = self.grad_through_norm(positive_raw, p_grads)
 
                 grad_W = (
                     a_grad_raw.T @ anchor_sparse + p_grad_raw.T @ positive_sparse
@@ -210,7 +210,7 @@ class EmbeddingModel:
                 scale = learning_rate / len(batch)
                 np.subtract(self.W, scale * grad_W, out=self.W)  # In-place update for efficiency
 
-            avg_loss = epoch_loss / max(num_batches, 1)
+            avg_loss = epoch_loss / num_batches
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 logger.info(f"Epoch {epoch + 1:>3}/{num_epochs}  loss={avg_loss:.4f}")
 
