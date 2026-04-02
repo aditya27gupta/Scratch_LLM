@@ -25,39 +25,6 @@ from utility import load_names_data, logger
 np.random.default_rng(42)  # for reproducibility in any numpy operations
 
 
-# === CONSTANTS AND HYPERPARAMETERS ===
-
-# Model architecture — deliberately simple so optimizer differences are visible
-N_EMBD = 16  # embedding dimension (small to keep scalar autograd tractable)
-VOCAB_SIZE = 0  # set after loading data (number of unique characters + BOS)
-
-# Training parameters — shared across all optimizer runs
-NUM_STEPS = 600  # training iterations per optimizer
-BATCH_SIZE = 64  # names sampled per step — small because scalar autograd builds a
-# full computation graph per Value operation; batch_size=4 with
-# ~5 bigrams per name ≈ 20 forward passes per step, each creating
-# thousands of Value nodes. Larger batches are cost-prohibitive.
-
-# Optimizer-specific hyperparameters
-SGD_LR = 0.05  # SGD needs a larger learning rate to make progress
-MOMENTUM_LR = 0.05  # momentum accumulates velocity, so smaller lr is stable
-MOMENTUM_BETA = 0.9  # exponential decay rate for velocity (standard choice)
-RMSPROP_LR = 0.01  # adaptive lr means we can start smaller
-RMSPROP_BETA = 0.99  # decay rate for squared gradient average
-RMSPROP_EPS = 1e-8  # prevents division by zero in denominator
-ADAM_LR = 0.01  # Adam's bias correction allows moderate lr
-ADAM_BETA1 = 0.9  # first moment decay (momentum component)
-ADAM_BETA2 = 0.999  # second moment decay (RMSProp component)
-ADAM_EPS = 1e-8  # numerical stability in denominator
-
-# Signpost: these hyperparameters are tuned for this specific problem scale. In production,
-# Adam(lr=3e-4, beta1=0.9, beta2=0.999) is the standard starting point for most deep learning.
-
-# Extension parameters — warmup + cosine decay applied to Adam
-WARMUP_STEPS = 20  # linearly ramp lr from 0 to peak over this many steps
-COSINE_LR = 0.01  # peak learning rate after warmup
-
-
 # === BIGRAM MODEL ===
 # A character bigram predicts the next character given only the current character.
 # Architecture: embed(char) → linear → softmax → next char distribution.
@@ -144,10 +111,7 @@ def step_sgd(
 
 
 def step_momentum(
-    params: list[np.ndarray],
-    grads: list[np.ndarray],
-    learning_rate: float,
-    state: dict,
+    params: list[np.ndarray], grads: list[np.ndarray], learning_rate: float, state: dict, momentum_beta: float = 0.9
 ) -> None:
     """SGD with momentum — adds a velocity term that accumulates past gradients.
 
@@ -164,7 +128,7 @@ def step_momentum(
         state["velocity"] = [np.zeros_like(p) for p in params]  # initialize velocity for each parameter
 
     for i, (param, grad) in enumerate(zip(params, grads)):
-        state["velocity"][i] = MOMENTUM_BETA * state["velocity"][i] + grad  # v = β*v + ∇L
+        state["velocity"][i] = momentum_beta * state["velocity"][i] + grad  # v = β*v + ∇L
         param -= learning_rate * state["velocity"][i]  # θ = θ - lr
 
 
@@ -173,6 +137,8 @@ def step_rmsprop(
     grads: list[np.ndarray],
     learning_rate: float,
     state: dict,
+    rmsprop_beta: float = 0.99,
+    rmsprop_eps: float = 1e-8,
 ) -> None:
     """RMSProp — adapts the learning rate per-parameter using squared gradient history.
 
@@ -188,8 +154,8 @@ def step_rmsprop(
         state["sq_avg"] = [np.zeros_like(p) for p in params]
 
     for i, (param, grad) in enumerate(zip(params, grads)):
-        state["sq_avg"][i] = RMSPROP_BETA * state["sq_avg"][i] + (1 - RMSPROP_BETA) * grad**2  # s = β*s + (1-β)*∇L²
-        param -= learning_rate * grad / (np.sqrt(state["sq_avg"][i]) + RMSPROP_EPS)  # θ = θ - lr * ∇L/√(s+ε)
+        state["sq_avg"][i] = rmsprop_beta * state["sq_avg"][i] + (1 - rmsprop_beta) * grad**2  # s = β*s + (1-β)*∇L²
+        param -= learning_rate * grad / (np.sqrt(state["sq_avg"][i]) + rmsprop_eps)  # θ = θ - lr * ∇L/√(s+ε)
 
 
 def step_adam(
@@ -197,6 +163,9 @@ def step_adam(
     grads: list[np.ndarray],
     learning_rate: float,
     state: dict,
+    adam_beta1: float = 0.9,
+    adam_beta2: float = 0.999,
+    adam_eps: float = 1e-8,
 ) -> None:
     """Adam — combines momentum (first moment) with RMSProp (second moment) plus bias correction.
 
@@ -211,6 +180,7 @@ def step_adam(
 
     Adam's dominance in practice comes from combining the best of both worlds: momentum provides noise-averaged gradient direction, while adaptive scaling provides per-parameter step sizes.
     """
+
     if "step_count" not in state:
         state["step_count"] = 0
         state["m"] = [np.zeros_like(p) for p in params]
@@ -218,17 +188,17 @@ def step_adam(
 
     state["step_count"] += 1
     t = state["step_count"]
-    bc1 = 1 - ADAM_BETA1**t
-    bc2 = 1 - ADAM_BETA2**t
+    bc1 = 1 - adam_beta1**t
+    bc2 = 1 - adam_beta2**t
 
     for i, (param, grad) in enumerate(zip(params, grads)):
-        state["m"][i] = ADAM_BETA1 * state["m"][i] + (1 - ADAM_BETA1) * grad  # m = β1*m + (1-β1)*∇L
-        state["v"][i] = ADAM_BETA2 * state["v"][i] + (1 - ADAM_BETA2) * grad**2  # v = β2*v + (1-β2)*∇L²
+        state["m"][i] = adam_beta1 * state["m"][i] + (1 - adam_beta1) * grad  # m = β1*m + (1-β1)*∇L
+        state["v"][i] = adam_beta2 * state["v"][i] + (1 - adam_beta2) * grad**2  # v = β2*v + (1-β2)*∇L²
 
         m_hat = state["m"][i] / bc1  # m̂ = m / (1-β1^t)
         v_hat = state["v"][i] / bc2  # v̂ = v / (1-β2^t)
 
-        param -= learning_rate * m_hat / (np.sqrt(v_hat) + ADAM_EPS)  # θ = θ - lr * m̂ / √(v̂ + ε)
+        param -= learning_rate * m_hat / (np.sqrt(v_hat) + adam_eps)  # θ = θ - lr * m̂ / √(v̂ + ε)
 
 
 # === TRAINING LOOP ===
@@ -239,13 +209,14 @@ def step_adam(
 
 def train_optimizer(
     optimizer_name: str,
+    batch_size: int,
     step_fn: Callable,
     learning_rate: float,
     params: tuple[np.ndarray, np.ndarray],
     bigrams: tuple[np.ndarray, np.ndarray],
     num_steps: int,
     lr_schedule_fn: Callable | None = None,
-) -> tuple[list[float], float]:
+) -> tuple[list[float], float, tuple[np.ndarray, np.ndarray]]:
     """Train a bigram model using a specific optimizer and return loss history."""
     context_data, target_data = bigrams
     param_list = list(params)  # convert tuple to list for mutability
@@ -254,7 +225,7 @@ def train_optimizer(
 
     start_time = time.perf_counter()
     for step in range(num_steps):
-        idx = np.random.randint(0, len(context_data) - 1, BATCH_SIZE)
+        idx = np.random.randint(0, len(context_data) - 1, batch_size)
         loss, grad_emb, grad_proj = bigram_loss_and_grads(params, context_data[idx], target_data[idx])
         effective_lr = lr_schedule_fn(step, num_steps) if lr_schedule_fn else learning_rate
         step_fn(param_list, [grad_emb, grad_proj], effective_lr, state)
@@ -265,20 +236,20 @@ def train_optimizer(
                 f"{optimizer_name:>20s} -> Step {step + 1:>3d}/{num_steps} | Loss: {loss:.4f} | LR: {effective_lr:.5f}"
             )
 
-    return loss_history, time.perf_counter() - start_time
+    return loss_history, time.perf_counter() - start_time, params
 
 
-def cosine_schedule(step: int, num_steps: int) -> float:
+def cosine_scheduler(step: int, num_steps: int, learning_rate: float = 0.01, warmup_steps: int = 20) -> float:
     """Compute learning rate with linear warmup followed by cosine decay.
     Returns the actual learning rate (not a multiplier), matching Adam's expected lr range.
     """
-    if step < WARMUP_STEPS:
+    if step < warmup_steps:
         # Linear warmup: lr grows from 0 to COSINE_LR over WARMUP_STEPS
-        return COSINE_LR * (step + 1) / WARMUP_STEPS
+        return learning_rate * (step + 1) / warmup_steps
 
     # Cosine decay: lr decreases from COSINE_LR to 0 following cos curve
-    progress = (step - WARMUP_STEPS) / max(1, num_steps - WARMUP_STEPS)
-    return COSINE_LR * 0.5 * (1 + np.cos(np.pi * progress))
+    progress = (step - warmup_steps) / max(1, num_steps - warmup_steps)
+    return learning_rate * 0.5 * (1 + np.cos(np.pi * progress))
 
 
 # === Create Dataset ===
@@ -286,85 +257,102 @@ def cosine_schedule(step: int, num_steps: int) -> float:
 
 def create_training_dataset(names_list: list[str]) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, int]]:
     # Build vocabulary from unique characters
-    global VOCAB_SIZE
     unique_chars = sorted(set("".join(names_list)))
-    char_set = {ch: idx for idx, ch in enumerate(unique_chars)}
+    char_to_token = {ch: idx for idx, ch in enumerate(unique_chars)}
     special_tokens = {"BOS": len(unique_chars), "EOS": len(unique_chars) + 1}
-    char_set.update(special_tokens)
-    VOCAB_SIZE = len(char_set)
+    char_to_token.update(special_tokens)
 
-    logger.info(f"Vocabulary: {VOCAB_SIZE} tokens ({len(unique_chars)} chars)")
+    logger.info(f"Vocabulary: {len(char_to_token)} tokens ({len(unique_chars)} chars)")
 
     # Tokenize all names: [BOS, char_0, char_1, ..., char_n, BOS]
     all_context: list[int] = []
     all_targets: list[int] = []
     for name in names_list:
-        token_seq = [char_set["BOS"]] + [char_set[ch] for ch in name] + [char_set["EOS"]]
+        token_seq = [char_to_token["BOS"]] + [char_to_token[ch] for ch in name] + [char_to_token["EOS"]]
         for i in range(len(token_seq) - 1):
             all_context.append(token_seq[i])
             all_targets.append(token_seq[i + 1])
 
     context_data = np.array(all_context, dtype=np.int32)
     target_data = np.array(all_targets, dtype=np.int32)
-    return (context_data, target_data), char_set
+    return (context_data, target_data), char_to_token
+
+
+def generate_sample_results(model_results: list, char_to_token: dict[str, int]) -> None:
+    num_samples = 10
+    max_length = 20
+    temperature = 0.8
+    token_to_char = {idx: ch for ch, idx in char_to_token.items()}
+
+    # Generate 10 names via autoregressive sampling
+    logger.info(f"{'Optimizer':<20s} {'Sampled Results':<50s}")
+    for name, *_, learned_params in model_results:
+        embedding, projection = learned_params
+        vocab_size = len(char_to_token)
+        generated: list[str] = [""] * num_samples
+
+        for sample_idx in range(num_samples):
+            token_id = char_to_token["BOS"]  # start with BOS token
+
+            for _ in range(max_length):  # max name length
+                # Forward pass: embed → project → softmax
+                emb = embedding[token_id]
+                logits = projection @ emb
+                logits = (logits - logits.max()) / temperature  # apply temperature scaling
+                exp_vals = np.exp(logits)
+                probs = exp_vals / np.sum(exp_vals)
+
+                token_id = int(np.random.choice(vocab_size, p=probs))  # sample next token
+                if token_id == char_to_token["EOS"] or token_id == char_to_token["BOS"]:
+                    break
+                generated[sample_idx] += token_to_char[token_id]
+
+        logger.info(f"{name:<20s} {'\t'.join(generated)}")
 
 
 # === COMPARISON AND RESULTS ===
 
 
 def run_optimizer_comparison(
-    sgd_lr: float,
-    momentum_lr: float,
-    rmsprop_lr: float,
-    adam_lr: float,
-    cosine_lr: float,
     num_steps: int,
+    batch_size: int,
+    num_embed: int,
+    optimizer_map: list[dict],
 ) -> None:
     """Run all optimizers with the given learning rates and step count."""
-    global VOCAB_SIZE, NUM_STEPS, COSINE_LR
-
-    NUM_STEPS = num_steps
-    COSINE_LR = cosine_lr
-
     # -- Load and prepare data --
     logger.info("Loading data...")
     docs = load_names_data()
     docs = [doc.strip().lower() for doc in docs.decode("utf-8").splitlines()]
     np.random.shuffle(docs)
 
-    training_data, char_set = create_training_dataset(docs)
+    training_data, char_to_token = create_training_dataset(docs)
     logger.info(f"Total data in dataset: {len(training_data):,}")
+    vocab_size = len(char_to_token)
 
     # Initialize base model parameters (shared starting point via cloning)
-    base_params = make_params(VOCAB_SIZE, N_EMBD)
+    base_params = make_params(vocab_size=vocab_size, embd_dim=num_embed)
 
     param_count = sum(p.size for p in base_params)
-    logger.info(f"Model parameters: {param_count:,}, Training: {num_steps} steps, batch size {BATCH_SIZE}")
+    logger.info(f"Model parameters: {param_count:,}, Training: {num_steps} steps, batch size {batch_size}")
 
     # -- Train with each optimizer --
-    optimizers = [
-        ("SGD", step_sgd, sgd_lr, None),
-        ("SGD + Momentum", step_momentum, momentum_lr, None),
-        ("RMSProp", step_rmsprop, rmsprop_lr, None),
-        ("Adam", step_adam, adam_lr, None),
-        ("Adam + Schedule", step_adam, cosine_lr, cosine_schedule),
-    ]
+    results = []
 
-    results: list[tuple[str, list[float], float]] = []
-
-    for name, step_fn, lr, schedule_fn in optimizers:
-        logger.info(f"--- {name} -> (lr={lr}) ---")
+    for optimizer in optimizer_map:
+        logger.info(f"--- {optimizer['name']} -> (lr={optimizer['learning_rate']}) ---")
         params_copy = clone_params(base_params)
-        loss_history, elapsed = train_optimizer(
-            name,
-            step_fn,
-            lr,
-            params_copy,
-            training_data,
-            num_steps,
-            lr_schedule_fn=schedule_fn,
+        loss_history, elapsed, trained_params = train_optimizer(
+            optimizer_name=optimizer["name"],
+            batch_size=batch_size,
+            step_fn=optimizer["step_func"],
+            learning_rate=optimizer["learning_rate"],
+            params=params_copy,
+            bigrams=training_data,
+            num_steps=num_steps,
+            lr_schedule_fn=optimizer["lr_scheduler"],
         )
-        results.append((name, loss_history, elapsed))
+        results.append((optimizer["name"], loss_history, elapsed, trained_params))
         logger.info(f"Final loss: {loss_history[-1]:.4f} | Time: {elapsed:.1f}s\n")
 
     # -- Comparison table --
@@ -379,7 +367,7 @@ def run_optimizer_comparison(
     )
     logger.info("-" * 76)
 
-    for name, loss_history, elapsed in results:
+    for name, loss_history, elapsed, _ in results:
         final_loss = loss_history[-1]
         best_loss = min(loss_history)
 
@@ -394,42 +382,20 @@ def run_optimizer_comparison(
 
     logger.info("=" * 76)
 
-    # -- Inference: generate names with the best model (Adam + Schedule) --
-    # Use the last trained model (Adam + Schedule) for generation
-    logger.info("\n--- Generating names with Adam + Schedule model ---\n")
-    best_params = clone_params(base_params)
-    best_param_list = list(best_params)  # convert to list for mutability
-    adam_state: dict = {}
-
-    for step in range(num_steps):
-        idx = np.random.randint(0, len(training_data[0]) - 1, BATCH_SIZE)
-        _, grad_emb, grad_proj = bigram_loss_and_grads(best_params, training_data[0][idx], training_data[1][idx])
-        step_adam(best_param_list, [grad_emb, grad_proj], cosine_schedule(step, num_steps), adam_state)
-
-    # Generate 10 names via autoregressive sampling
-    embedding, projection = best_params
-    temperature = 0.8
-
-    for sample_idx in range(10):
-        token_id = char_set["BOS"]  # start with BOS token
-        generated: list[str] = []
-
-        for _ in range(20):  # max name length
-            # Forward pass: embed → project → softmax
-            emb = embedding[token_id]
-            logits = projection @ emb
-            logits = (logits - logits.max()) / temperature  # apply temperature scaling
-            exp_vals = np.exp(logits)
-            probs = exp_vals / np.sum(exp_vals)
-
-            token_id = int(np.random.choice(VOCAB_SIZE, p=probs))  # sample next token
-            if token_id == char_set["EOS"] or token_id == char_set["BOS"]:
-                break
-            generated.append(next(ch for ch, idx in char_set.items() if idx == token_id))
-
-        logger.info(f"  {sample_idx + 1:>2}. {''.join(generated)}")
+    generate_sample_results(results, char_to_token)
 
 
 if __name__ == "__main__":
-    # === DEFAULT BEHAVIOR (unchanged) ===
-    run_optimizer_comparison(SGD_LR, MOMENTUM_LR, RMSPROP_LR, ADAM_LR, COSINE_LR, NUM_STEPS)
+    # Model architecture — deliberately simple so optimizer differences are visible
+    N_EMBD = 16  # embedding dimension (small to keep scalar autograd tractable)
+    NUM_STEPS = 600  # training iterations per optimizer
+    BATCH_SIZE = 64  # names sampled per step — small because scalar autograd builds a
+
+    optimizer_map: list[dict] = [
+        {"name": "SGD", "step_func": step_sgd, "learning_rate": 0.05, "lr_scheduler": None},
+        {"name": "SGD + Momentum", "step_func": step_momentum, "learning_rate": 0.05, "lr_scheduler": None},
+        {"name": "RMSProp", "step_func": step_rmsprop, "learning_rate": 0.01, "lr_scheduler": None},
+        {"name": "Adam", "step_func": step_adam, "learning_rate": 0.01, "lr_scheduler": None},
+        {"name": "Adam + Schedule", "step_func": step_adam, "learning_rate": 0.01, "lr_scheduler": cosine_scheduler},
+    ]
+    run_optimizer_comparison(num_steps=NUM_STEPS, batch_size=BATCH_SIZE, num_embed=N_EMBD, optimizer_map=optimizer_map)
